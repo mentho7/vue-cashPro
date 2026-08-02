@@ -1,0 +1,19 @@
+{
+  "name": "cashpro",
+  "version": "1.0.0",
+  "description": "CashPro - AI 大盘预测数据看板（静态渲染）",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "build-data": "node scripts/build-data.js"
+  },
+  "dependencies": {
+    "vue": "^3.4.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.8",
+    "vite": "8.2.0"
+  }
+}
