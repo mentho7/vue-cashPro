@@ -1,357 +1,212 @@
-# CashPro 上线清单
+# CashPro 部署手册
 
-> **适用系统:** Ubuntu 24.04 LTS (apt 包管理器)
-> **服务器:** 阿里云 ECS `47.116.75.3` | **域名:** `minthol.cn`
-
-## 架构概览
-
-```
-本地 WorkBuddy                阿里云 ECS
-    │                            │
-    │  scp morning.json ──────→  /var/www/cashpro/data/morning_latest.json
-    │  scp evening.json ──────→  /var/www/cashpro/data/evening_latest.json
-    │  scp history.json ──────→  /var/www/cashpro/data/history.json
-    │                            │
-    │                      Nginx 静态服务 + 数据目录
-    │                            │
-    │  用户浏览器 ←─ HTTPS ─── Vue 静态站点 (dist/)
-    │       │
-    │       └─ fetch /data/morning_latest.json
-    │       └─ fetch /data/evening_latest.json
-    │       └─ fetch /data/history.json
-    │       └─ 前端 JS 合并 → 动态渲染
-```
-
-**零额外费用：** 利用 ECS 自带磁盘和 Nginx，不需租 OSS。
+> **适用环境**：Ubuntu 24.04 LTS · nginx 1.24.0 · 阿里云 ECS `47.116.75.3` · 域名 `minthol.cn`
+> **校准时间**：2026-11-04（以服务器实际配置与数据目录为准，覆盖此前版本）
+> **配套文件**：[DATA_SPEC.md](DATA_SPEC.md)（数据结构契约）、[deploy/nginx-data.conf](deploy/nginx-data.conf)（数据目录 nginx 片段）
 
 ---
 
-## 第一步：服务器初始化（一次性，5 分钟）
+## 0. 三分钟看懂：代码与数据是两条独立的发布通道
 
-### 1.1 登录服务器
-
-```bash
-ssh root@47.116.75.3
+```
+本地 D:\WorkSpace\vue-cashPro
+  │
+  ├─ npm run build ──→ dist/{index.html, assets/}
+  │      │
+  │      └─ 只推这 2 样 ──────→ /var/www/cashpro/dist/
+  │                                  └─ nginx: root = 这个目录
+  │
+  └─（数据不走部署）────────→ /var/www/cashpro/data/
+                                     └─ nginx: location /data/ → alias 到这个目录
 ```
 
-### 1.2 一键初始化（推荐）
+**必须记住的三个事实**（旧版文档在这里是错的，见附录）：
 
-将 `server-setup.sh` 上传到服务器执行，自动完成：安装 Nginx → 创建目录 → 写入占位数据 → 配置站点 → 启动服务 → 开放防火墙。
+1. **数据不在 `dist/` 里**。nginx 用 `location /data/ { alias /var/www/cashpro/data/; }` 单独服务数据目录，与 `dist/` 完全解耦。
+2. **数据是按日期命名的一堆文件**，不是 `morning_latest.json` 单文件。当前线上：`morning/` 43 个、`evening/` 40 个。
+3. **`scp -r dist/*` 是危险的**。本地 `public/data/` 是空目录，`dist/data/` 因此也是空的——整目录覆盖会把它推到服务器上，虽然 nginx 不读它，但会与真实数据目录混淆，未来极易踩坑。
+
+---
+
+## 1. 环境事实（已逐条核对）
+
+| 项 | 实际值 |
+|---|---|
+| nginx | 1.24.0 (Ubuntu)，`systemctl is-active nginx` = active |
+| 站点配置 | `/etc/nginx/sites-available/cashpro`（HTTP + HTTPS 双 server 块） |
+| 站点根 | `/var/www/cashpro/dist`，`index index.html` |
+| 数据路由 | `location /data/` → `alias /var/www/cashpro/data/`，带 `Access-Control-Allow-Origin: *` 和 `no-cache` |
+| HTTPS | Let's Encrypt，`/etc/letsencrypt/live/minthol.cn/` |
+| 数据规模 | `data/morning/` 43 个 JSON、`data/evening/` 40 个 JSON、`data/health.json` |
+| 目录属主 | `/var/www/cashpro` 与 `data` 为 `root:root 755`；`dist` 为 `root:root 751`（异常位，见 §8） |
+| 备份目录 | `/var/www/cashpro/dist_backup`、`/var/www/cashpro/dist.bak.20260803133517` |
+| 服务器工具 | `rsync`、`tar`、`scp` 均可用 |
+| 本地工具链 | Node v26.13.0 · npm 11.20.0 · vite 8.2.0 · vue 3.5.40 |
+
+---
+
+## 2. 发布前：本地验收（必做，约 5 分钟）
+
+### 2.1 干净构建
 
 ```bash
-# 在本地执行（远程注入脚本）
-ssh root@47.116.75.3 'bash -s' < deploy/server-setup.sh
+cd /d/WorkSpace/vue-cashPro      # Git Bash；或在本目录用 PowerShell
+npm ci                            # 严格按 package-lock 安装，勿用 npm install 改动 lock
+npm run build                     # 产物在 dist/
 ```
 
-或手动上传后执行：
+预期输出（当前版本基线）：`index.html` ≈ 0.42 kB、`assets/index-*.css` ≈ 22.2 kB、`assets/index-*.js` ≈ 93.1 kB，耗时 < 1 秒。
+
+### 2.2 本地直接预览 → 只会看到空态，这是正常的
 
 ```bash
-scp deploy/server-setup.sh root@47.116.75.3:/tmp/
-ssh root@47.116.75.3 'bash /tmp/server-setup.sh'
+npm run preview -- --port 4173
+# 浏览器打开 http://localhost:4173
 ```
 
-### 1.3 手动配置 Nginx（如未用一键脚本）
+原因：`src/utils/dataLoader.js` 按**当天日期**去拉 `/data/morning/YYYY-MM-DD-morning.json`，而本地 `public/data/` 是空目录，必然 404。此时页面应显示空态文案（`盘后数据尚未更新` 等），**控制台出现 404 不是缺陷**。
 
-如果已通过 1.2 一键初始化，跳过本步。手动配置方式：
+### 2.3 用生产数据做真实渲染验收（推荐）
+
+`dataLoader.js:35` 支持 `VITE_DATA_BASE`，把数据基址指向线上即可在本地跑真实数据（线上 `/data/` 已带 `Access-Control-Allow-Origin: *`，跨域可用）：
 
 ```bash
-# 安装 Nginx (Ubuntu 24.04 用 apt)
-apt-get update && apt-get install -y nginx
-
-# 站点配置写入 Ubuntu 标准路径
-vim /etc/nginx/sites-available/cashpro
-
-# 启用站点 (创建符号链接到 sites-enabled/)
-ln -s /etc/nginx/sites-available/cashpro /etc/nginx/sites-enabled/cashpro
-rm -f /etc/nginx/sites-enabled/default
-
-# 测试并重载
-nginx -t && systemctl reload nginx
+VITE_DATA_BASE=https://minthol.cn npm run build
+npm run preview -- --port 4173
 ```
 
-### 1.4 配置防火墙
+> ⚠ **测完必须重新执行一次不带该变量的 `npm run build`**，否则生产域名会被烘进 `import.meta.env`，这份产物不能发布。
+
+### 2.4 产物自检（不依赖浏览器）
 
 ```bash
-# Ubuntu 24.04 使用 ufw
-ufw allow 'Nginx Full'
-ufw --force enable
-```
+# 1) 中文字符串集合指纹——与线上产物的指纹应一致
+python -c "import re,io,glob,hashlib;s=set();[s.update(re.findall('[\u4e00-\u9fff]{2,}',io.open(f,encoding='utf-8',errors='ignore').read())) for f in glob.glob('dist/assets/*.js')+glob.glob('dist/assets/*.css')];t='\n'.join(sorted(s));print(len(s),hashlib.md5(t.encode()).hexdigest())"
 
-> 同时在阿里云控制台 → 安全组 → 添加入方向规则：开放 80 和 443 端口。
-
-### 1.5 配置 HTTPS（推荐）
-
-```bash
-# 安装 certbot (Ubuntu 24.04 直接 apt 安装)
-apt install -y certbot python3-certbot-nginx
-
-# 一键申请 Let's Encrypt 证书并自动配置 Nginx
-certbot --nginx -d minthol.cn
-
-# 自动续期已内置，测试续期:
-certbot renew --dry-run
-```
-
-### 1.6 验证数据目录可访问
-
-```bash
-# 写一个测试文件
-echo '{"status":"ok"}' > /var/www/cashpro/data/health.json
-# 从本地测试
-curl https://minthol.cn/data/health.json
-# 应返回 {"status":"ok"}
+# 2) 确认新功能已进包（历史表格可点击 + 未来事件文案）
+grep -c "table-row-clickable" dist/assets/*.css
+grep -o "未来 5 条重大市场事件" dist/assets/*.js
 ```
 
 ---
 
-## 第二步：上传初始数据（5 分钟）
+## 3. 部署静态站点（只推 2 类文件）
 
-将本地已有的历史数据上传到服务器，确保首次访问有内容显示。
-
-### 2.1 制作 morning_latest.json
+### 3.1 先在服务器备份
 
 ```bash
-# 在本地 cashpro/ 目录下执行
-scp deploy/sample-morning.json root@47.116.75.3:/var/www/cashpro/data/morning_latest.json
+ssh root@47.116.75.3 'cd /var/www/cashpro && cp -a dist dist.bak.$(date +%Y%m%d%H%M%S) && ls -d dist.bak.*'
 ```
 
-### 2.2 制作 evening_latest.json
+### 3.2 上传（Windows / PowerShell · Git Bash 均适用）
 
 ```bash
-scp deploy/sample-evening.json root@47.116.75.3:/var/www/cashpro/data/evening_latest.json
+# ① 资源目录（带 hash，新增不会冲突）
+scp -r dist/assets root@47.116.75.3:/var/www/cashpro/dist/
+
+# ② 入口文件（必须最后传，保证新旧资源切换原子）
+scp dist/index.html root@47.116.75.3:/var/www/cashpro/dist/index.html
 ```
 
-### 2.3 制作 history.json
+> **不要**执行 `scp -r dist/* root@47.116.75.3:/var/www/cashpro/dist/`：它会把空 `data/`、`docs/` 一起推上去。
+> 若本机有 rsync（WSL / Git Bash）可顺手清理旧资源：`rsync -av --delete dist/assets/ root@47.116.75.3:/var/www/cashpro/dist/assets/`（`--delete` 作用域仅限 `assets/`，安全）。
+
+### 3.3 部署后校验（无需 reload nginx，纯静态）
 
 ```bash
-scp deploy/sample-history.json root@47.116.75.3:/var/www/cashpro/data/history.json
+curl -I https://minthol.cn/ | head -3
+curl -s https://minthol.cn/ | grep -o 'assets/index-[A-Za-z0-9_-]*\.js' | head -1
+# 用上一步拿到的文件名再验一次 200
+curl -o /dev/null -w "%{http_code} %{size_download}B\n" https://minthol.cn/assets/index-XXXX.js
+curl -s https://minthol.cn/data/health.json
 ```
+
+判定：首页 200、asset 200 且体积与本地 `dist/assets` 一致、`health.json` 返回 `{"status":"ok"...}`。
 
 ---
 
-## 第三步：构建并部署前端（3 分钟）
+## 4. 数据发布（独立通道，与代码发布互不影响）
 
-### 3.1 本地构建
+### 4.1 目录与命名契约
 
-```bash
-cd cashpro/
-npm run build    # 或用 node_modules/vite/bin/vite.js build
+```
+/var/www/cashpro/data/
+├── health.json                        # 健康探针
+├── morning/2026-07-27-morning.json    # 早盘：date, summary, sentiment, bullishDirections, bearishDirections, fullReport
+└── evening/2026-07-27-evening.json    # 晚盘：date, hitResult, afterHoursSummary, marketEvents[]
 ```
 
-输出在 `dist/` 目录。
+- 前端按**当天日期**取当日文件，并向过去 30 天回溯构建历史表格；缺失日期直接跳过（不报错）。
+- `marketEvents` 为 v4 结构化格式：`{ direction: "利好"|"利空", sector: "板块名", event: "事件描述" }`。字段细节以 [DATA_SPEC.md](DATA_SPEC.md) 为准。
 
-### 3.2 部署到服务器
+### 4.2 上传单日数据（原子写法，避免前端读到半个文件）
 
 ```bash
-# 部署静态站点
-scp -r dist/* root@47.116.75.3:/var/www/cashpro/dist/
-
-# 同时上传示例数据文件
-scp deploy/sample-morning.json root@47.116.75.3:/var/www/cashpro/data/morning_latest.json
-scp deploy/sample-evening.json root@47.116.75.3:/var/www/cashpro/data/evening_latest.json
-scp deploy/sample-history.json root@47.116.75.3:/var/www/cashpro/data/history.json
+scp 2026-11-04-morning.json root@47.116.75.3:/tmp/
+ssh root@47.116.75.3 'mv /tmp/2026-11-04-morning.json /var/www/cashpro/data/morning/ && chown root:root /var/www/cashpro/data/morning/2026-11-04-morning.json'
 ```
 
-### 3.3 验证
-
-浏览器打开 `https://minthol.cn`，应看到完整看板。
+**禁止**为了"刷新"而清空 `data/` 目录（`rm -rf /var/www/cashpro/data/*`）——那里是 40+ 天积累的唯一副本，代码可通过备份回滚，数据不能。
 
 ---
 
-## 第四步：配置 SSH 免密登录（用于 WorkBuddy 自动上传）
-
-WorkBuddy 定时任务需要通过 `scp` 自动上传，需要免密。
-
-### 4.1 本地生成 SSH 密钥（如果没有）
+## 5. 回滚
 
 ```bash
-ssh-keygen -t ed25519 -C "workbuddy-cashpro" -f ~/.ssh/id_ed25519_cashpro -N ""
+ssh root@47.116.75.3 'cd /var/www/cashpro && ls -d dist.bak.* | tail -3'
+ssh root@47.116.75.3 'cd /var/www/cashpro && rm -rf dist && cp -a dist.bak.<时间戳> dist'
 ```
 
-### 4.2 复制公钥到服务器
-
-```bash
-ssh-copy-id -i ~/.ssh/id_ed25519_cashpro.pub root@47.116.75.3
-```
-
-### 4.3 测试免密登录
-
-```bash
-ssh -i ~/.ssh/id_ed25519_cashpro root@47.116.75.3 "echo OK"
-```
+数据无需回滚（与代码解耦）。回滚后按 §3.3 复验一次。
 
 ---
 
-## 第五步：配置 WorkBuddy 定时任务
+## 6. 端到端验收清单
 
-### 5.1 早盘任务（每日 8:00）
+发布后打开 `https://minthol.cn`，逐项勾选：
 
-**名称：** CashPro 早盘数据上传
-
-**Cron：** `0 8 * * 1-5`（工作日早 8 点）
-
-**Prompt：**
-
-```
-你是 CashPro 的数据生成代理。请完成以下任务：
-
-1. 读取最新的盘前分析文档（位于 cashpro/public/docs/ 下按日期命名的 MD 文件，取最新一个）
-2. 从中提取以下结构化数据，生成 JSON：
-   - date: 日期，格式 YYYY-MM-DD
-   - summary: 全文的交易观点总结原文
-   - sentiment: 散户情绪，必须是"乐观"/"悲观"/"中性"之一
-   - bullishDirections: 利好方向数组，如 ["AI应用","大消费"]
-   - bearishDirections: 利空方向数组，如 ["银行","地产链"]
-   - fullReport: 完整的 MD 原文（用于前端弹窗展示）
-3. 将 JSON 保存到 F:\filetoAI\2026-08-02-14-39-00\cashpro\deploy\out\morning.json
-4. 使用 scp 上传到服务器：
-   scp -i ~/.ssh/id_ed25519_cashpro F:\filetoAI\2026-08-02-14-39-00\cashpro\deploy\out\morning.json root@47.116.75.3:/var/www/cashpro/data/morning_latest.json
-
-注意：JSON 必须是合法的 UTF-8 编码，不要包含注释。
-```
-
-### 5.2 晚盘任务（每日 16:30）
-
-**名称：** CashPro 晚盘数据上传
-
-**Cron：** `30 16 * * 1-5`（工作日 16:30）
-
-**Prompt：**
-
-```
-你是 CashPro 的数据生成代理。请完成以下任务：
-
-1. 基于你掌握的最新收盘数据，生成以下 JSON：
-   - date: 日期，格式 YYYY-MM-DD
-   - hitResult: 命中结果，必须是"准确命中"/"小幅偏差"/"明显偏差"之一
-   - afterHoursSummary: 盘后总结，一句话描述实际走势与预测的对比
-   - events: 市场事件数组，格式 [{"date":"8月1日","title":"美国公布非农数据","tag":"可能利空出口板块"}]
-
-2. 将 JSON 保存到 F:\filetoAI\2026-08-02-14-39-00\cashpro\deploy\out\evening.json
-
-3. 同时生成 history.json：读取服务器上现有的 /var/www/cashpro/data/history.json，将今天的数据（morning_latest.json + evening_latest.json 合并）追加进去，保持最近 30 条
-
-4. 使用 scp 上传：
-   scp -i ~/.ssh/id_ed25519_cashpro F:\filetoAI\2026-08-02-14-39-00\cashpro\deploy\out\evening.json root@47.116.75.3:/var/www/cashpro/data/evening_latest.json
-   scp -i ~/.ssh/id_ed25519_cashpro F:\filetoAI\2026-08-02-14-39-00\cashpro\deploy\out\history.json root@47.116.75.3:/var/www/cashpro/data/history.json
-
-注意：hitResult 必须用这三个值之一，不要扩展。
-```
-
----
-
-## 第六步：验证端到端
-
-### 6.1 验证数据文件存在
-
-```bash
-ssh root@47.116.75.3 "ls -la /var/www/cashpro/data/"
-```
-
-应看到：
-- `morning_latest.json`
-- `evening_latest.json`
-- `history.json`
-
-### 6.2 验证 HTTPS 可访问
-
-```bash
-curl https://minthol.cn/data/morning_latest.json | python3 -m json.tool
-curl https://minthol.cn/data/evening_latest.json | python3 -m json.tool
-curl https://minthol.cn/data/history.json | python3 -m json.tool
-```
-
-### 6.3 验证前端加载
-
-浏览器打开 `https://minthol.cn`，检查：
+- [ ] 首页正常渲染，无白屏（`index.html` 指向的 asset 必须 200）
+- [ ] 控制台无 `[CashPro] 数据加载失败`
 - [ ] 交易观点卡片显示盘前数据
-- [ ] 点击交易观点卡片 → 弹窗显示完整报告
-- [ ] 复盘报告三列卡片显示命中验证
-- [ ] 周度预测成功率环形图有数据
-- [ ] 近期市场事件时间线有内容
-- [ ] 历史交易观点表格有数据
+- [ ] **点击历史表格任意有数据行 → 弹窗显示当日完整盘前计划**（本次新增能力）
+- [ ] 无报告的日期行：鼠标悬停提示「当日暂无完整报告」，点击无反应（不应报错）
+- [ ] 键盘 Tab 到表格行后按 Enter / 空格同样能打开弹窗（无障碍路径）
+- [ ] 时间线标题为「未来市场事件」，副标题为「未来 5 条重大市场事件」
+- [ ] 复盘卡片三列命中结果配色为设计确认后的色值（`#3A7BD5 / #D9B44A / #5A6C8A`）
+- [ ] 数据缺失日显示「盘后数据尚未更新」空态
 
 ---
 
-## 附录 A：目录结构总览
+## 7. 故障排查
 
-```
-cashpro/                        # 本地项目
-├── src/                            # Vue 源码
-├── dist/                           # 构建产物 → 上传到服务器
-├── deploy/
-│   ├── DEPLOY.md                   # 本文件
-│   ├── nginx-data.conf             # Nginx 数据目录配置
-│   ├── server-setup.sh             # 服务器一键初始化脚本
-│   └── out/                        # WorkBuddy 输出目录
-│       ├── morning.json            # 早盘生成
-│       ├── evening.json            # 晚盘生成
-│       └── history.json            # 合并历史
-├── public/docs/                    # 手动词版留档（可选）
-└── DATA_SPEC.md                    # 数据格式规范
-
-服务器:
-/var/www/cashpro/
-├── dist/                           # 静态站点
-└── data/
-    ├── morning_latest.json         # 最新早盘数据
-    ├── evening_latest.json         # 最新晚盘数据
-    └── history.json                # 全量历史记录
-```
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 白屏 / 首页 404 | `index.html` 未更新，或引用的 asset 未上传 | 补传 `index.html` + `assets/`，用 §3.3 的第一条 curl 定位 |
+| 页面能开但无数据 | `/data/` 404 或 alias 未生效 | `curl https://minthol.cn/data/health.json`；查 `/etc/nginx/sites-available/cashpro` 的 alias 路径 |
+| 有新数据但页面仍旧 | 浏览器/中间层缓存 | 数据已带 `no-cache`，强制刷新（Ctrl+F5） |
+| 点击表格行弹窗不弹 | 该行 `fullReport` 为空 | 属预期（`HistoryTable` 有 `if (!row.fullReport) return`）；检查对应 morning JSON 的 `fullReport` 字段 |
+| 本地预览全是 404 | `public/data/` 为空，本地无数据 | 属正常；按 §2.3 用 `VITE_DATA_BASE` 指向线上验证 |
+| HTTPS 证书告警 | 证书过期 | `certbot renew --dry-run` → `certbot renew` |
 
 ---
 
-## 附录 B：需要开启的权限
+## 8. 安全与权限注意
 
-| 权限 | 用途 | 如何开启 |
-|------|------|----------|
-| ECS 22 端口（SSH） | scp 上传文件 | 阿里云安全组开放 22 端口（通常默认已开） |
-| ECS 80 端口（HTTP） | 用户访问站点（HTTP） | 安全组开放 80 + `ufw allow 'Nginx Full'` |
-| ECS 443 端口（HTTPS） | 用户访问站点（HTTPS） | 安全组开放 443 + `ufw allow 'Nginx Full'` |
-| SSH 密钥免密 | WorkBuddy 自动上传 | 见第四步 |
-| HTTPS 证书 | Let's Encrypt 免费证书 | `certbot --nginx -d minthol.cn`（见 1.5） |
-
-> **双重防火墙**: 阿里云 ECS 有两层防火墙——阿里云安全组（云端）和 ufw（系统内）。两层都要开放端口才能访问。
+- **`/var/www/cashpro/dist` 权限是 `drwx---rwx`（751）**，group 无权限、other 有 `rwx`，属于历史误设。建议修正为 `chmod 755`：`ssh root@47.116.75.3 'chmod 755 /var/www/cashpro/dist'`。修正前请注意，任何能登录该机的账号都对该目录可写。
+- 不要直接改 `/etc/nginx/**` 做临时验证；改配置必须 `nginx -t` 通过再 `systemctl reload nginx`。
+- 生产机为 root 登录：建议后续收敛为普通用户 + sudo，SSH 密钥登录（参见旧文档第四步的密钥思路，本次不做变更）。
+- 本地 `package-lock.json` 已与 `master` 一致，**任何 `npm install <包名>` 都会污染 lock**，部署构建只用 `npm ci`。
 
 ---
 
-## 附录 C：数据格式速查
+## 附录：与旧版 DEPLOY.md 的关键勘误
 
-### morning_latest.json
-```json
-{
-  "date": "2026-08-03",
-  "summary": "今日市场预计震荡偏强...",
-  "sentiment": "乐观",
-  "bullishDirections": ["AI应用", "大消费"],
-  "bearishDirections": ["银行", "地产链"],
-  "fullReport": "# 08月03日盘前计划\n\n## 市场观察\n\n..."
-}
-```
+旧版文档保留于 `dist.bak.*` 之外的仓库历史中，以下 5 处已在本次校准中修正，请勿再照旧版执行：
 
-### evening_latest.json
-```json
-{
-  "date": "2026-08-03",
-  "hitResult": "准确命中",
-  "afterHoursSummary": "AI应用如期领涨...",
-  "events": [
-    {"date": "8月1日", "title": "美国公布非农数据", "tag": "可能利空出口板块"}
-  ]
-}
-```
-
-### history.json
-```json
-[
-  {
-    "date": "2026-08-02",
-    "summary": "...",
-    "sentiment": "乐观",
-    "bullishDirections": ["AI应用"],
-    "bearishDirections": ["银行"],
-    "hitResult": "准确命中",
-    "afterHoursSummary": "..."
-  }
-]
-```
+| 旧版说法 | 实际情况 |
+|---|---|
+| 数据为 `morning_latest.json` / `evening_latest.json` / `history.json` 三文件 | 已改为 `morning/YYYY-MM-DD-morning.json`、`evening/YYYY-MM-DD-evening.json` 按日期分目录（43 + 40 个） |
+| 架构图称前端 fetch `/data/morning_latest.json` | 实际由 `src/utils/dataLoader.js` 按当天日期 + 回溯 30 天动态拼接 URL |
+| 部署命令 `scp -r dist/* root@…:/var/www/cashpro/dist/` | 会把空 `data/`、`docs/` 一并推上去；只应传 `assets/` 与 `index.html` |
+| 数据放在 `/var/www/cashpro/data/` 下"平铺" | 目录结构为 `data/{morning,evening}/`，nginx 用 alias 而非 root |
+| Cron Prompt 中写死 `F:\filetoAI\2026-08-02-14-39-00\cashpro\...` | 该路径已失效；数据生成流程请以 `scripts/build-data.js` 与当前工作目录为准 |
