@@ -1,0 +1,9 @@
+# 依赖与构建产物
+node_modules/
+dist/
+.vite/
+
+# 本地临时文件与日志
+.tmp_*
+*.log
+npm-debug.log*
