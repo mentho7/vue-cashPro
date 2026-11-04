@@ -60,8 +60,8 @@
       <!-- 右侧：最近事件时间线 -->
       <div class="chart-card chart-timeline">
         <div class="chart-card-header">
-          <div class="chart-title">近期市场事件</div>
-          <div class="chart-subtitle">最近 {{ events.length }} 条重大市场事件</div>
+          <div class="chart-title">未来市场事件</div>
+          <div class="chart-subtitle">未来 5 条重大市场事件</div>
         </div>
 
         <div class="timeline-body">
@@ -97,7 +97,17 @@
       </div>
 
       <div class="table-body">
-        <div v-for="row in rows" :key="row.date" class="table-row">
+        <div
+          v-for="row in rows"
+          :key="row.date"
+          class="table-row table-row-clickable"
+          role="button"
+          tabindex="0"
+          :title="row.fullReport ? '点击查看当日完整盘前计划' : '当日暂无完整报告'"
+          @click="openDoc(row)"
+          @keydown.enter="openDoc(row)"
+          @keydown.space.prevent="openDoc(row)"
+        >
           <span class="table-td table-td-date">{{ row.date }}</span>
           <span :class="sentimentTextClass(row.sentiment)" class="table-td table-td-sentiment">
             {{ sentimentLabel(row.sentiment) }}
@@ -136,6 +146,14 @@ const props = defineProps({
   history: { type: Array, required: true },
   events: { type: Array, default: () => [] }
 })
+
+const emit = defineEmits(['open-doc'])
+
+/* ── 行点击：打开当日完整盘前计划 ───────────── */
+function openDoc(row) {
+  if (!row || !row.fullReport) return
+  emit('open-doc', { rawMarkdown: row.fullReport, date: row.date })
+}
 
 /* ── 配色（截图风格固定配色）────────────────── */
 const COLORS = {
@@ -250,3 +268,15 @@ function timelineTagBg(tag) {
   return TAG_PALETTE['默认'].bg
 }
 </script>
+
+<style scoped>
+.table-row-clickable {
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.table-row-clickable:hover { background-color: rgba(127,176,255,0.06); }
+.table-row-clickable:focus-visible {
+  outline: 2px solid rgba(127,176,255,0.45);
+  outline-offset: -2px;
+}
+</style>

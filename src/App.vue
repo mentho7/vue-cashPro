@@ -15,13 +15,13 @@
     <template v-else-if="data">
       <NavBar />
       <HeroSection :data="data.latest" />
-      <PredictionCard :data="data.latest" @open-doc="showModal = true" />
+      <PredictionCard :data="data.latest" @open-doc="openDoc(data.latest.fullReport)" />
       <DailyReview :data="data.latest" />
-      <HistoryTable :data="data.latest" :events="data.events" :history="data.history" />
+      <HistoryTable :data="data.latest" :events="data.events" :history="data.history" @open-doc="openRowDoc" />
       <FooterSection />
 
       <DocModal
-        :raw-markdown="data.latest.fullReport"
+        :raw-markdown="docMarkdown"
         :show="showModal"
         @close="showModal = false"
       />
@@ -44,6 +44,18 @@ const data = ref(null)
 const loading = ref(true)
 const error = ref('')
 const showModal = ref(false)
+const docMarkdown = ref('')
+
+/* ── 打开盘前计划弹窗 ──────────────────── */
+function openDoc(md) {
+  docMarkdown.value = md || ''
+  showModal.value = true
+}
+
+/* ── 表格行点击：payload 来自 HistoryTable ── */
+function openRowDoc(payload) {
+  if (payload && payload.rawMarkdown) openDoc(payload.rawMarkdown)
+}
 
 onMounted(async () => {
   try {

@@ -821,10 +821,10 @@ body::after {
   font-size: 13px; font-weight: 700;
 }
 
-.hit-yes { color: var(--blue-light); }
+.hit-yes { color: #3A7BD5; }
 .hit-no { color: var(--text-muted); }
-.hit-partial { color: var(--gold); }
-.hit-deviation { color: var(--red); }
+.hit-partial { color: #D9B44A; }
+.hit-deviation { color: #5A6C8A; }
 
 /* 盘后总结 */
 .table-td-after {
@@ -1035,6 +1035,7 @@ body::after {
 .modal-body {
   flex: 1;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 0 28px 28px;
   scrollbar-width: thin;
   scrollbar-color: var(--card-border) transparent;
